@@ -255,7 +255,18 @@ exports.init = function (grunt) {
         return dfd.reject(makeError(MSG_ERR_DOWNLOAD, src, err || res.statusCode));
       }
 
-      res
+      //Check if output needs to be gunzip'd
+      var output, gzip = false;
+      if (res.headers["content-encoding"] == "gzip") {
+        var gunzip = zlib.createGunzip();
+        res.pipe(gunzip);
+        output = gunzip;
+        gzip = true;
+      } else {
+        output = res;
+      }
+
+      output
         .on('data', function (chunk) {
           file.write(chunk);
         })
@@ -265,26 +276,38 @@ exports.init = function (grunt) {
         .on('end', function () {
           file.end();
 
+          var doHashCheck = function(data) {
+            // The etag head in the response from s3 has double quotes around
+            // it. Strip them out.
+            var remoteHash = res.headers.etag.replace(/"/g, '');
+
+            // Get an md5 of the local file so we can verify the download.
+            var localHash = crypto.createHash('md5').update(data).digest('hex');
+
+            if (remoteHash === localHash) {
+              var msg = util.format(MSG_DOWNLOAD_SUCCESS, src, localHash);
+              dfd.resolve(msg);
+            }
+            else {
+              dfd.reject(makeError(MSG_ERR_CHECKSUM, 'Download', localHash, remoteHash, src));
+            }
+          };
+
           // Read the local file so we can get its md5 hash.
           fs.readFile(dest, function (err, data) {
             if (err) {
               return dfd.reject(makeError(MSG_ERR_DOWNLOAD, src, err));
             }
-            else {
-              // The etag head in the response from s3 has double quotes around
-              // it. Strip them out.
-              var remoteHash = res.headers.etag.replace(/"/g, '');
-
-              // Get an md5 of the local file so we can verify the download.
-              var localHash = crypto.createHash('md5').update(data).digest('hex');
-
-              if (remoteHash === localHash) {
-                var msg = util.format(MSG_DOWNLOAD_SUCCESS, src, localHash);
-                dfd.resolve(msg);
-              }
-              else {
-                dfd.reject(makeError(MSG_ERR_CHECKSUM, 'Download', localHash, remoteHash, src));
-              }
+            //If content was transferred as gzip, we need to zip it again
+            if (gzip) {
+              zlib.gzip(data, function(err, gzdata) {
+                if (err) {
+                  return dfd.reject(makeError(MSG_ERR_DOWNLOAD, src, err));
+                }
+                doHashCheck(gzdata);
+              });
+            } else {
+              doHashCheck(data);
             }
           });
         });
